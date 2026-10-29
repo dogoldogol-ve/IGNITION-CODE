@@ -1,0 +1,251 @@
+#include "BluetoothSerial.h"
+
+// LED pins
+#define GREEN_LED_PIN 25
+#define RED_LED_PIN   33
+
+// Buzzer and Push Button Pin
+#define BUZZER_PIN    26
+#define BUTTON_PIN    27
+
+// Set HIGH for an active-HIGH buzzer.
+// Change to LOW if your buzzer module is active-LOW.
+#define BUZZER_ACTIVE_LEVEL HIGH
+
+BluetoothSerial SerialBT;
+
+String inputBuffer = "";
+
+const unsigned long LINK_TIMEOUT_MS = 90000;
+const unsigned long CRASH_CANCEL_WINDOW_MS = 5000;
+const unsigned long BUTTON_DEBOUNCE_MS = 40;
+
+unsigned long lastMessageTime = 0;
+unsigned long crashPendingAt = 0;
+unsigned long lastDebounceTime = 0;
+
+bool crashPending = false;
+bool alarmActive = false;
+
+bool lastButtonReading = HIGH;
+bool stableButtonState = HIGH;
+
+// Function declarations
+void handleMessage(const String &msg);
+void setIgnitionEnabled();
+void setIgnitionDisabled();
+void setBuzzer(bool on);
+void handleButton();
+void cancelCrashAlert();
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(GREEN_LED_PIN, OUTPUT);
+  pinMode(RED_LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  setIgnitionDisabled();
+  setBuzzer(false);
+
+  SerialBT.begin("IgnitionUnit");
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("  IGNITION INDICATOR - ESP32");
+  Serial.println("================================");
+  Serial.println("[OK] Bluetooth: IgnitionUnit");
+  Serial.println("[OK] Buzzer: GPIO26");
+  Serial.println("[OK] Push button: GPIO27");
+  Serial.println("[INFO] Waiting for HelmetUnit...");
+}
+
+void loop() {
+  // Receive messages from the helmet ESP32
+  while (SerialBT.available()) {
+    char c = SerialBT.read();
+
+    if (c == '\n') {
+      handleMessage(inputBuffer);
+      inputBuffer = "";
+    } else if (c != '\r') {
+      inputBuffer += c;
+    }
+  }
+
+  // Check push button
+  handleButton();
+
+  // End the cancellation window after 5 seconds.
+  // Keep the buzzer sounding if the alert was not cancelled.
+  if (crashPending &&
+      millis() - crashPendingAt >= CRASH_CANCEL_WINDOW_MS) {
+
+    crashPending = false;
+
+    Serial.println(
+      "[ALERT] Cancellation window expired."
+    );
+
+    Serial.println(
+      "[ALERT] Emergency notification will proceed."
+    );
+  }
+
+  // Bluetooth link timeout
+  if (lastMessageTime != 0 &&
+      millis() - lastMessageTime > LINK_TIMEOUT_MS) {
+
+    setIgnitionDisabled();
+
+    Serial.println(
+      "[WARN] Bluetooth timeout - Ignition DISABLED."
+    );
+
+    lastMessageTime = 0;
+  }
+
+  delay(5);
+}
+
+void handleMessage(const String &msg) {
+  String m = msg;
+  m.trim();
+
+  if (m == "IGNITION_ENABLED") {
+    setIgnitionEnabled();
+
+    Serial.println(
+      "[STATE] Ignition ENABLED - Green LED ON"
+    );
+
+  } else if (m == "IGNITION_DISABLED") {
+    setIgnitionDisabled();
+
+    Serial.println(
+      "[STATE] Ignition DISABLED - Red LED ON"
+    );
+
+  } else if (m == "CRASH_PENDING") {
+    crashPending = true;
+    alarmActive = true;
+    crashPendingAt = millis();
+
+    setBuzzer(true);
+
+    Serial.println();
+    Serial.println("[CRASH] CRASH DETECTED!");
+    Serial.println("[BUZZER] Alarm ON");
+    Serial.println(
+      "[BUTTON] Press within 5 seconds to cancel the alert."
+    );
+
+  } else if (m == "CRASH_CANCELLED") {
+    crashPending = false;
+    alarmActive = false;
+
+    setBuzzer(false);
+
+    Serial.println("[CANCELLED] Emergency alert cancelled.");
+    Serial.println("[BUZZER] Alarm OFF");
+
+  } else if (m == "CRASH_CONFIRMED") {
+    crashPending = false;
+
+    Serial.println(
+      "[CRASH] Cancellation window expired."
+    );
+    Serial.println(
+      "[INFO] Helmet is proceeding with GPS and SMS."
+    );
+
+  } else if (m.startsWith("LOG:")) {
+    Serial.println("[HELMET] " + m.substring(4));
+
+  } else if (m.length() > 0) {
+    Serial.println("[WARN] Unknown message: " + m);
+  }
+
+  lastMessageTime = millis();
+}
+
+void handleButton() {
+  bool reading = digitalRead(BUTTON_PIN);
+
+  if (reading != lastButtonReading) {
+    lastDebounceTime = millis();
+  }
+
+  if (millis() - lastDebounceTime >= BUTTON_DEBOUNCE_MS) {
+    if (reading != stableButtonState) {
+      stableButtonState = reading;
+
+      // INPUT_PULLUP: LOW means the button is pressed
+      if (stableButtonState == LOW && alarmActive) {
+
+        if (crashPending &&
+            millis() - crashPendingAt <
+                CRASH_CANCEL_WINDOW_MS) {
+
+          cancelCrashAlert();
+
+        } else {
+          // The cancellation window has expired.
+          // Silence the buzzer without cancelling the SMS.
+          setBuzzer(false);
+          alarmActive = false;
+
+          Serial.println(
+            "[BUZZER] Alarm silenced. Emergency processing continues."
+          );
+        }
+      }
+    }
+  }
+
+  lastButtonReading = reading;
+}
+
+void cancelCrashAlert() {
+  // Send cancellation to the helmet ESP32 first.
+  if (SerialBT.connected()) {
+    SerialBT.println("CANCEL_CRASH");
+  } else {
+    Serial.println(
+      "[ERROR] Bluetooth disconnected; cancellation not confirmed."
+    );
+
+    // Do not claim the emergency alert was cancelled.
+    return;
+  }
+
+  crashPending = false;
+  alarmActive = false;
+
+  setBuzzer(false);
+
+  Serial.println("[BUTTON] Cancellation requested.");
+  Serial.println("[BUZZER] Alarm OFF");
+  Serial.println(
+    "[INFO] Waiting for helmet cancellation confirmation."
+  );
+}
+
+void setIgnitionEnabled() {
+  digitalWrite(GREEN_LED_PIN, HIGH);
+  digitalWrite(RED_LED_PIN, LOW);
+}
+
+void setIgnitionDisabled() {
+  digitalWrite(GREEN_LED_PIN, LOW);
+  digitalWrite(RED_LED_PIN, HIGH);
+}
+
+void setBuzzer(bool on) {
+  digitalWrite(
+    BUZZER_PIN,
+    on ? BUZZER_ACTIVE_LEVEL :
+         (BUZZER_ACTIVE_LEVEL == HIGH ? LOW : HIGH)
+  );
+}
