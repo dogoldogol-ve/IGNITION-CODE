@@ -1,0 +1,895 @@
+/*
+  ============================================================
+  HELMET UNIT - ESP32 #1
+  Helmet-Activated Ignition System with Integrated Crash
+  Detection and Automated Emergency Notification
+
+  Features:
+  1. IR helmet-wearing detection
+  2. MPU6050 crash detection and confirmation
+  3. Bluetooth communication with IgnitionUnit
+  4. Five-second crash cancellation window
+  5. GPS location acquisition
+  6. SIM800L emergency SMS and retry
+  7. Last-known GPS location fallback
+
+  Required libraries:
+  - TinyGPSPlus
+  - BluetoothSerial (ESP32 Arduino core)
+  - Wire (included with Arduino)
+
+  BOARD: ESP32 Dev Module
+  ============================================================
+*/
+
+#include <Wire.h>
+#include <TinyGPSPlus.h>
+#include "BluetoothSerial.h"
+#include <math.h>
+
+// ============================================================
+// MPU6050 REGISTERS
+// ============================================================
+
+#define MPU_ADDR         0x68
+#define REG_PWR_MGMT_1   0x6B
+#define REG_ACCEL_CONFIG 0x1C
+#define REG_GYRO_CONFIG  0x1B
+#define REG_ACCEL_XOUT_H 0x3B
+
+const float ACCEL_SCALE = 4096.0;  // +/- 8g
+const float GYRO_SCALE  = 65.5;    // +/- 500 degrees/second
+
+struct MotionReading {
+  float accelG;
+  float gyroDps;
+};
+
+// ============================================================
+// PIN CONFIGURATION
+// ============================================================
+
+// IR sensor
+#define IR_SENSOR_PIN 34
+
+// MPU6050
+#define MPU_SDA_PIN 22
+#define MPU_SCL_PIN 23
+
+// GPS: GPS TX -> ESP32 GPIO32
+//      GPS RX -> ESP32 GPIO33
+#define GPS_RX_PIN  32
+#define GPS_TX_PIN  33
+#define GPS_BAUD    9600
+
+// SIM800L: SIM TX -> ESP32 GPIO27
+//          SIM RX -> ESP32 GPIO26
+#define SIM_RX_PIN 27
+#define SIM_TX_PIN 26
+#define SIM_BAUD   9600
+
+// ============================================================
+// CRASH DETECTION SETTINGS
+// ============================================================
+
+// Set true for easier controlled testing.
+// Set false for thesis testing.
+#define TEST_MODE false
+
+#if TEST_MODE
+const float ACCEL_THRESHOLD_G  = 1.5;
+const float GYRO_THRESHOLD_DPS = 50.0;
+#else
+const float ACCEL_THRESHOLD_G  = 3.5;
+const float GYRO_THRESHOLD_DPS = 250.0;
+#endif
+
+const uint32_t CONFIRM_WINDOW_MS = 2500;
+const uint32_t SETTLE_GRACE_MS   = 1200;
+
+const float STABLE_ACCEL_G  = 1.15;
+const float STABLE_GYRO_DPS = 40.0;
+
+const float NEAR_MISS_ACCEL_G  = 2.0;
+const float NEAR_MISS_GYRO_DPS = 150.0;
+
+const uint32_t NEAR_MISS_LOG_INTERVAL_MS = 1500;
+const uint32_t HEARTBEAT_INTERVAL_MS = 2000;
+
+// Five-second cancellation period
+const uint32_t CRASH_CANCEL_WINDOW_MS = 5000;
+
+// ============================================================
+// EMERGENCY CONTACTS
+// ============================================================
+
+const char* EMERGENCY_CONTACTS[] = {
+  "+639941174977",
+  "+639998121193"
+};
+
+const uint8_t NUM_EMERGENCY_CONTACTS =
+  sizeof(EMERGENCY_CONTACTS) /
+  sizeof(EMERGENCY_CONTACTS[0]);
+
+const uint32_t SMS_RETRY_INTERVAL_MS = 30000;
+const uint8_t SMS_MAX_RETRIES = 5;
+
+// ============================================================
+// GLOBAL OBJECTS
+// ============================================================
+
+TinyGPSPlus gps;
+
+HardwareSerial GPS_Serial(1);
+HardwareSerial SIM_Serial(2);
+
+BluetoothSerial SerialBT;
+
+// ============================================================
+// GLOBAL VARIABLES
+// ============================================================
+
+bool helmetWornPrev = false;
+bool crashInProgress = false;
+
+unsigned long lastHeartbeat = 0;
+unsigned long lastNearMissLog = 0;
+
+double lastLat = 0.0;
+double lastLng = 0.0;
+
+bool hasFix = false;
+unsigned long lastFixTime = 0;
+
+// ============================================================
+// FUNCTION DECLARATIONS
+// ============================================================
+
+// MPU
+bool initMPU();
+void writeMPUReg(uint8_t reg, uint8_t value);
+MotionReading readMPU();
+
+// Crash detection
+void monitorForCrash();
+bool confirmCrash();
+void handleCrashEvent();
+
+// Cancellation
+bool waitForCrashCancellation(uint32_t timeoutMs);
+
+// GPS
+void feedGPS();
+bool acquireGPSFix(
+  double &lat,
+  double &lng,
+  uint32_t timeoutMs
+);
+
+// SIM800L
+void initSIM800L();
+String sendAT(const String &cmd, uint32_t waitMs);
+String waitForResponse(uint32_t waitMs);
+bool sendSMS(const char* number, const String &message);
+
+// Bluetooth
+void connectToIgnitionUnit();
+void sendBT(const String &msg);
+void logMsg(const String &msg);
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("         HELMET UNIT - ESP32");
+  Serial.println("========================================");
+
+  // IR SENSOR
+  pinMode(IR_SENSOR_PIN, INPUT);
+  Serial.println("[OK] IR sensor initialized.");
+
+  // MPU6050
+  Wire.begin(MPU_SDA_PIN, MPU_SCL_PIN);
+
+  Serial.println("[INFO] MPU SDA -> GPIO22");
+  Serial.println("[INFO] MPU SCL -> GPIO23");
+
+  if (!initMPU()) {
+    Serial.println("[ERROR] MPU6050 not detected.");
+    Serial.println("[ERROR] Check I2C wiring and power.");
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  Serial.println("[OK] MPU6050 initialized.");
+
+  // GPS UART
+  GPS_Serial.begin(
+    GPS_BAUD,
+    SERIAL_8N1,
+    GPS_RX_PIN,
+    GPS_TX_PIN
+  );
+
+  Serial.println("[OK] GPS UART started.");
+  Serial.println("[INFO] GPS module TX -> ESP32 GPIO32");
+  Serial.println("[INFO] GPS module RX -> ESP32 GPIO33");
+
+  // SIM800L UART
+  SIM_Serial.begin(
+    SIM_BAUD,
+    SERIAL_8N1,
+    SIM_RX_PIN,
+    SIM_TX_PIN
+  );
+
+  Serial.println("[OK] SIM800L UART started.");
+  Serial.println("[INFO] SIM800L TX -> ESP32 GPIO27");
+  Serial.println("[INFO] SIM800L RX -> ESP32 GPIO26");
+
+  delay(3000);
+  initSIM800L();
+
+  // Bluetooth client
+  SerialBT.begin("HelmetUnit", true);
+
+  Serial.println("[OK] Bluetooth started.");
+  Serial.println("[INFO] Connecting to IgnitionUnit...");
+
+  connectToIgnitionUnit();
+
+  logMsg("[BOOT] Helmet Unit initialized.");
+
+  Serial.println("========================================");
+  Serial.println("              SYSTEM READY");
+  Serial.println("========================================");
+}
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+
+void loop() {
+  // Continuously process GPS input when the main loop is active.
+  feedGPS();
+
+  // Manual crash test: enter TESTCRASH in Serial Monitor.
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+
+    if (cmd == "TESTCRASH" && !crashInProgress) {
+      logMsg("[TEST] Manual crash test triggered.");
+
+      crashInProgress = true;
+      handleCrashEvent();
+      crashInProgress = false;
+    }
+  }
+
+  // IR SENSOR
+  // LOW = helmet worn; HIGH = helmet removed.
+  bool helmetWorn =
+    (digitalRead(IR_SENSOR_PIN) == LOW);
+
+  if (helmetWorn != helmetWornPrev) {
+    if (helmetWorn) {
+      sendBT("IGNITION_ENABLED");
+      logMsg("[STATE] Helmet worn. Ignition ENABLED.");
+    } else {
+      sendBT("IGNITION_DISABLED");
+      logMsg("[STATE] Helmet removed. Ignition DISABLED.");
+    }
+
+    helmetWornPrev = helmetWorn;
+    lastHeartbeat = millis();
+  }
+
+  // Bluetooth heartbeat
+  if (millis() - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
+    if (helmetWorn) {
+      sendBT("IGNITION_ENABLED");
+    } else {
+      sendBT("IGNITION_DISABLED");
+    }
+
+    lastHeartbeat = millis();
+  }
+
+  // Crash monitoring only while helmet is worn
+  if (helmetWorn && !crashInProgress) {
+    monitorForCrash();
+  }
+
+  delay(50);
+}
+
+// ============================================================
+// CRASH DETECTION
+// ============================================================
+
+void monitorForCrash() {
+  MotionReading r = readMPU();
+
+  if (r.accelG >= ACCEL_THRESHOLD_G &&
+      r.gyroDps >= GYRO_THRESHOLD_DPS) {
+
+    logMsg(
+      "[TRIGGER] Acceleration=" +
+      String(r.accelG, 2) +
+      "g, Gyro=" +
+      String(r.gyroDps, 1) +
+      "dps. Confirming event."
+    );
+
+    crashInProgress = true;
+
+    if (confirmCrash()) {
+      logMsg("[CONFIRMED] Crash event confirmed.");
+      handleCrashEvent();
+    } else {
+      logMsg(
+        "[DISMISSED] Motion settled. "
+        "False alarm avoided."
+      );
+    }
+
+    crashInProgress = false;
+    return;
+  }
+
+  // Near-miss logging
+  if ((r.accelG >= NEAR_MISS_ACCEL_G ||
+       r.gyroDps >= NEAR_MISS_GYRO_DPS) &&
+      millis() - lastNearMissLog >=
+        NEAR_MISS_LOG_INTERVAL_MS) {
+
+    logMsg(
+      "[NO-TRIGGER] Acceleration=" +
+      String(r.accelG, 2) +
+      "g, Gyro=" +
+      String(r.gyroDps, 1) +
+      "dps."
+    );
+
+    lastNearMissLog = millis();
+  }
+}
+
+// ============================================================
+// CRASH CONFIRMATION
+// ============================================================
+
+bool confirmCrash() {
+  unsigned long start = millis();
+
+  uint16_t judgedSamples = 0;
+  uint16_t stableSamples = 0;
+
+  while (millis() - start < CONFIRM_WINDOW_MS) {
+    MotionReading r = readMPU();
+
+    if (millis() - start >= SETTLE_GRACE_MS) {
+      bool settled =
+        (fabs(r.accelG - 1.0) <=
+          (STABLE_ACCEL_G - 1.0)) &&
+        (r.gyroDps <= STABLE_GYRO_DPS);
+
+      judgedSamples++;
+
+      if (settled) {
+        stableSamples++;
+      }
+    }
+
+    delay(100);
+  }
+
+  if (judgedSamples == 0) {
+    return true;
+  }
+
+  float stableRatio =
+    (float)stableSamples / (float)judgedSamples;
+
+  bool settledOverall = (stableRatio >= 0.7);
+
+  logMsg(
+    "[CONFIRM-DATA] Stable samples: " +
+    String(stableSamples) + "/" +
+    String(judgedSamples) +
+    " (" + String(stableRatio * 100.0, 0) +
+    "%)."
+  );
+
+  return !settledOverall;
+}
+
+// ============================================================
+// CRASH EVENT HANDLER
+// Five-second cancellation before GPS/SMS
+// ============================================================
+
+void handleCrashEvent() {
+  // Notify the indicator to turn on the buzzer
+  // and start its five-second cancellation window.
+  sendBT("CRASH_PENDING");
+
+  logMsg(
+    "[ALERT] Crash confirmed. "
+    "Waiting 5 seconds for cancellation."
+  );
+
+  // Wait for the indicator push button.
+  bool cancelled =
+    waitForCrashCancellation(CRASH_CANCEL_WINDOW_MS);
+
+  if (cancelled) {
+    sendBT("CRASH_CANCELLED");
+
+    logMsg(
+      "[CANCELLED] Rider cancelled the alert. "
+      "Skipping GPS acquisition and SMS."
+    );
+
+    return;
+  }
+
+  // Countdown expired. Proceed with emergency notification.
+  sendBT("CRASH_CONFIRMED");
+
+  logMsg(
+    "[ALERT] Cancellation window expired. "
+    "Acquiring GPS and preparing SMS."
+  );
+
+  // GPS ACQUISITION
+  double lat = 0.0;
+  double lng = 0.0;
+
+  bool liveFix = acquireGPSFix(lat, lng, 10000);
+
+  String coordText;
+
+  if (liveFix) {
+    lastLat = lat;
+    lastLng = lng;
+    hasFix = true;
+    lastFixTime = millis();
+
+    coordText =
+      String(lat, 6) + "," + String(lng, 6);
+
+    logMsg("[GPS] Live location acquired: " + coordText);
+
+  } else if (hasFix) {
+    coordText =
+      String(lastLat, 6) + "," +
+      String(lastLng, 6) +
+      " (last known, " +
+      String((millis() - lastFixTime) / 1000) +
+      " seconds old)";
+
+    logMsg("[GPS] Using last-known location.");
+
+  } else {
+    coordText = "GPS unavailable, no prior fix";
+
+    logMsg("[GPS] No valid location available.");
+  }
+
+  // Emergency SMS message
+  String message =
+    "CRASH DETECTED. Rider may need help. Location: " +
+    coordText;
+
+  logMsg("[ALERT] " + message);
+
+  // Send to each emergency contact.
+  for (uint8_t c = 0; c < NUM_EMERGENCY_CONTACTS; c++) {
+    const char* number = EMERGENCY_CONTACTS[c];
+
+    bool sent = false;
+    uint8_t attempts = 0;
+
+    while (!sent && attempts < SMS_MAX_RETRIES) {
+      attempts++;
+
+      logMsg(
+        "[SMS] Sending to " + String(number) +
+        ", attempt " + String(attempts) + "."
+      );
+
+      sent = sendSMS(number, message);
+
+      if (!sent && attempts < SMS_MAX_RETRIES) {
+        logMsg(
+          "[SMS] Attempt failed. Retrying in 30 seconds."
+        );
+
+        delay(SMS_RETRY_INTERVAL_MS);
+      }
+    }
+
+    if (sent) {
+      logMsg(
+        "[OK] SMS submission accepted for " +
+        String(number) + "."
+      );
+    } else {
+      logMsg(
+        "[FAIL] SMS failed after maximum retries for " +
+        String(number) + "."
+      );
+    }
+  }
+}
+
+// ============================================================
+// WAIT FOR CANCELLATION COMMAND
+// ============================================================
+
+bool waitForCrashCancellation(uint32_t timeoutMs) {
+  unsigned long start = millis();
+  String incoming = "";
+
+  while (millis() - start < timeoutMs) {
+    while (SerialBT.available()) {
+      char c = SerialBT.read();
+
+      if (c == '\n') {
+        incoming.trim();
+
+        if (incoming == "CANCEL_CRASH") {
+          logMsg("[CANCEL] Received cancellation command.");
+          return true;
+        }
+
+        if (incoming.length() > 0) {
+          Serial.println(
+            "[BT] During countdown: " + incoming
+          );
+        }
+
+        incoming = "";
+
+      } else if (c != '\r') {
+        incoming += c;
+
+        // Prevent unbounded growth if malformed input arrives.
+        if (incoming.length() > 150) {
+          incoming = "";
+        }
+      }
+    }
+
+    delay(10);
+  }
+
+  return false;
+}
+
+// ============================================================
+// GPS FUNCTIONS
+// ============================================================
+
+void feedGPS() {
+  while (GPS_Serial.available() > 0) {
+    gps.encode(GPS_Serial.read());
+  }
+
+  if (gps.location.isValid() &&
+      gps.location.isUpdated()) {
+
+    lastLat = gps.location.lat();
+    lastLng = gps.location.lng();
+
+    hasFix = true;
+    lastFixTime = millis();
+  }
+}
+
+bool acquireGPSFix(
+  double &lat,
+  double &lng,
+  uint32_t timeoutMs
+) {
+  unsigned long start = millis();
+
+  while (millis() - start < timeoutMs) {
+    feedGPS();
+
+    if (gps.location.isValid() &&
+        gps.location.age() < 3000) {
+
+      lat = gps.location.lat();
+      lng = gps.location.lng();
+
+      return true;
+    }
+
+    delay(10);
+  }
+
+  return false;
+}
+
+// ============================================================
+// SIM800L INITIALIZATION
+// ============================================================
+
+void initSIM800L() {
+  Serial.println("[SIM800L] Initializing modem...");
+
+  String response = sendAT("AT", 1500);
+  Serial.println("[SIM800L] AT response: " + response);
+
+  response = sendAT("ATE0", 1000);
+  Serial.println("[SIM800L] Echo setting: " + response);
+
+  response = sendAT("AT+CPIN?", 1500);
+  Serial.println("[SIM800L] SIM status: " + response);
+
+  response = sendAT("AT+CSQ", 1500);
+  Serial.println("[SIM800L] Signal quality: " + response);
+
+  response = sendAT("AT+CREG?", 1500);
+  Serial.println("[SIM800L] Network registration: " + response);
+
+  response = sendAT("AT+CMGF=1", 1000);
+  Serial.println("[SIM800L] SMS mode: " + response);
+
+  Serial.println(
+    "[SIM800L] Initialization commands completed. "
+    "Check responses above."
+  );
+}
+
+// ============================================================
+// SEND AT COMMAND
+// ============================================================
+
+String sendAT(const String &cmd, uint32_t waitMs) {
+  while (SIM_Serial.available()) {
+    SIM_Serial.read();
+  }
+
+  SIM_Serial.println(cmd);
+
+  return waitForResponse(waitMs);
+}
+
+// ============================================================
+// READ SIM800L RESPONSE
+// ============================================================
+
+String waitForResponse(uint32_t waitMs) {
+  unsigned long start = millis();
+  String response = "";
+
+  while (millis() - start < waitMs) {
+    while (SIM_Serial.available()) {
+      char c = (char)SIM_Serial.read();
+      response += c;
+
+      if (response.indexOf("\nOK\r") != -1 ||
+          response.indexOf("\nERROR\r") != -1) {
+        return response;
+      }
+    }
+
+    delay(2);
+  }
+
+  return response;
+}
+
+// ============================================================
+// SEND SMS
+// ============================================================
+
+bool sendSMS(const char* number, const String &message) {
+  // Set text mode and verify modem response.
+  String resp = sendAT("AT+CMGF=1", 1500);
+
+  if (resp.indexOf("OK") == -1) {
+    Serial.println("[SMS] Could not set SMS text mode.");
+    return false;
+  }
+
+  // Clear old response data.
+  while (SIM_Serial.available()) {
+    SIM_Serial.read();
+  }
+
+  String cmd = "AT+CMGS=\"" + String(number) + "\"";
+  SIM_Serial.println(cmd);
+
+  // Wait for the SMS prompt before sending message text.
+  resp = waitForResponse(5000);
+
+  if (resp.indexOf(">") == -1) {
+    Serial.println("[SMS] No message prompt received: " + resp);
+    return false;
+  }
+
+  SIM_Serial.print(message);
+  SIM_Serial.write(26);  // Ctrl+Z terminates the SMS
+
+  // Wait for +CMGS and final OK.
+  resp = waitForResponse(20000);
+
+  Serial.println("[SMS] Modem response: " + resp);
+
+  return (resp.indexOf("+CMGS:") != -1 &&
+          resp.indexOf("OK") != -1);
+}
+
+// ============================================================
+// BLUETOOTH CONNECTION
+// ============================================================
+
+void connectToIgnitionUnit() {
+  uint8_t attempts = 0;
+
+  while (!SerialBT.connected() && attempts < 10) {
+    Serial.println(
+      "[BT] Connecting to IgnitionUnit, attempt " +
+      String(attempts + 1) + "."
+    );
+
+    if (SerialBT.connect("IgnitionUnit")) {
+      break;
+    }
+
+    attempts++;
+    delay(1000);
+  }
+
+  if (SerialBT.connected()) {
+    Serial.println("[OK] Connected to IgnitionUnit.");
+  } else {
+    Serial.println("[WARN] Bluetooth connection unavailable.");
+  }
+}
+
+// ============================================================
+// SEND BLUETOOTH MESSAGE
+// ============================================================
+
+void sendBT(const String &msg) {
+  if (!SerialBT.connected()) {
+    connectToIgnitionUnit();
+  }
+
+  if (SerialBT.connected()) {
+    SerialBT.println(msg);
+  } else {
+    Serial.println("[BT ERROR] Message not sent: " + msg);
+  }
+}
+
+// ============================================================
+// LOG MESSAGE
+// ============================================================
+
+void logMsg(const String &msg) {
+  Serial.println(msg);
+  sendBT("LOG:" + msg);
+}
+
+// ============================================================
+// MPU INITIALIZATION
+// ============================================================
+
+bool initMPU() {
+  Wire.beginTransmission(MPU_ADDR);
+
+  if (Wire.endTransmission() != 0) {
+    return false;
+  }
+
+  writeMPUReg(REG_PWR_MGMT_1, 0x00);
+  delay(100);
+
+  // Accelerometer: +/- 8g
+  writeMPUReg(REG_ACCEL_CONFIG, 0x10);
+
+  // Gyroscope: +/- 500 degrees/second
+  writeMPUReg(REG_GYRO_CONFIG, 0x08);
+
+  return true;
+}
+
+void writeMPUReg(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  Wire.endTransmission();
+}
+
+// ============================================================
+// READ MPU6050
+// ============================================================
+
+MotionReading readMPU() {
+  MotionReading r = {0.0, 0.0};
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(REG_ACCEL_XOUT_H);
+
+  if (Wire.endTransmission(false) != 0) {
+    return r;
+  }
+
+  uint8_t received = Wire.requestFrom(
+    (uint8_t)MPU_ADDR,
+    (uint8_t)14
+  );
+
+  if (received != 14) {
+    while (Wire.available()) {
+      Wire.read();
+    }
+
+    Serial.println("[WARN] MPU read failed.");
+    return r;
+  }
+
+  int16_t ax = (int16_t)(
+    ((uint16_t)Wire.read() << 8) | Wire.read()
+  );
+
+  int16_t ay = (int16_t)(
+    ((uint16_t)Wire.read() << 8) | Wire.read()
+  );
+
+  int16_t az = (int16_t)(
+    ((uint16_t)Wire.read() << 8) | Wire.read()
+  );
+
+  // Skip temperature bytes.
+  Wire.read();
+  Wire.read();
+
+  int16_t gx = (int16_t)(
+    ((uint16_t)Wire.read() << 8) | Wire.read()
+  );
+
+  int16_t gy = (int16_t)(
+    ((uint16_t)Wire.read() << 8) | Wire.read()
+  );
+
+  int16_t gz = (int16_t)(
+    ((uint16_t)Wire.read() << 8) | Wire.read()
+  );
+
+  float axg = (float)ax / ACCEL_SCALE;
+  float ayg = (float)ay / ACCEL_SCALE;
+  float azg = (float)az / ACCEL_SCALE;
+
+  float gxDps = (float)gx / GYRO_SCALE;
+  float gyDps = (float)gy / GYRO_SCALE;
+  float gzDps = (float)gz / GYRO_SCALE;
+
+  r.accelG = sqrt(
+    axg * axg + ayg * ayg + azg * azg
+  );
+
+  r.gyroDps = sqrt(
+    gxDps * gxDps +
+    gyDps * gyDps +
+    gzDps * gzDps
+  );
+
+  return r;
+}
